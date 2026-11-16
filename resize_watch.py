@@ -15,13 +15,16 @@
 59 с и 1–2 ролика — каждый целиком, если короче 59 с, круг повторяется.
 Между кусками та же белая вспышка. Имя: edit_<порядок>_1080x1920_30s.mp4.
 
-Папка edit_9x16, ровно два ролика: тоже оба порядка.
-30 с — каждый по 15 с. Короткий внутри своих 15 с запускается заново.
-59 с — каждый заход не длиннее 30 с. Если ролик короче 30 с, берётся
-целиком и внутри этих 30 с не повторяется. Секунда, которой не хватает
-до 59, срезается с второго ролика (30 с + 29 с). Если один короче 30 с,
-его хвост добирает второй, пока у того есть кадры. Если обоих не хватает
-на 59 с, круг повторяется. Имя: edit_9x16_<порядок>_1080x1920_30s.mp4.
+Папка edit_9x16: все порядки.
+2 ролика — 30 с по 15 с. Короткий внутри своих 15 с запускается заново.
+59 с — заход не длиннее 30 с. Ролик короче 30 с берётся целиком.
+Секунда до 59 срезается со второго (30 с + 29 с). Если одного не хватает,
+хвост добирает тот, где ещё есть кадры. Если обоих мало, круг повторяется.
+3 ролика — 30 с по 10 с, 59 с по 20 с (последний 19 с).
+4 ролика — 59 с по 15 с (последний 14 с). Четыре по 10 с в 30 с не входят,
+на 30 с они делятся поровну, по 7,5 с.
+Короткий ролик внутри слота 10, 15 или 20 с запускается заново.
+Имя: edit_9x16_<порядок>_1080x1920_30s.mp4.
 """
 
 import fcntl
@@ -430,16 +433,48 @@ def plan_pieces(frame_counts, seconds):
     return pieces
 
 
-def plan_pair_9x16(frame_counts, seconds):
-    """Два ролика из edit_9x16 на ровно seconds * FPS.
+def plan_capped_slots(frame_counts, seconds, slot_frames):
+    """Каждый ролик занимает slot_frames кадров. Короткий внутри слота запускается заново.
 
-    30 с — по 15 с, короткий ролик внутри своих 15 с запускается заново.
-    59 с — заход не длиннее 30 с. Ролик короче 30 с берётся целиком.
-    Если сумма двух заходов больше 59 с, лишнее срезается со второго.
-    Если меньше, хвост добирается из ролика, где ещё остались кадры.
-    Когда кадров больше нет, те же заходы повторяются по кругу.
+    20 с × 3 и 15 с × 4 дают 60 с. Лишняя секунда срезается с хвоста,
+    чтобы вышло ровно seconds.
     """
-    if len(frame_counts) != 2 or seconds < 59:
+    target = seconds * FPS
+    pieces = []
+    for index, frames in enumerate(frame_counts):
+        src = max(int(frames), 1)
+        left = slot_frames
+        while left > 0:
+            take = min(src, left)
+            pieces.append((index, take))
+            left -= take
+    overflow = sum(take for _index, take in pieces) - target
+    while overflow > 0 and pieces:
+        index, take = pieces[-1]
+        if take > overflow:
+            pieces[-1] = (index, take - overflow)
+            overflow = 0
+        else:
+            overflow -= take
+            pieces.pop()
+    return [(index, take) for index, take in pieces if take > 0]
+
+
+def plan_pair_9x16(frame_counts, seconds):
+    """Ролики из edit_9x16 на ровно seconds * FPS.
+
+    2 ролика: 30 с по 15 с; 59 с до 30 с, короткий берётся целиком.
+    3 ролика: 30 с по 10 с, 59 с по 20 с.
+    4 ролика: 59 с по 15 с. На 30 с четыре по 10 с не входят, деление поровну.
+    """
+    count = len(frame_counts)
+    if count == 3 and seconds < 59:
+        return plan_capped_slots(frame_counts, seconds, 10 * FPS)
+    if count == 3 and seconds >= 59:
+        return plan_capped_slots(frame_counts, seconds, 20 * FPS)
+    if count == 4 and seconds >= 59:
+        return plan_capped_slots(frame_counts, seconds, 15 * FPS)
+    if count != 2 or seconds < 59:
         return plan_pieces(frame_counts, seconds)
     target = seconds * FPS
     cap = 30 * FPS
