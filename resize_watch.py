@@ -54,13 +54,19 @@ STATE = Path.home() / "Library/Application Support/render-resize"
 LOCK = STATE / "resize_watch.lock"
 LOG = STATE / "resize_watch.log"
 FPS = 30
+PLAN_VERSION = "2x15"
 SIZES = ((1080, 1920), (1080, 1080), (1920, 1080))
 # (длина в секундах, кадр, с которого начинается пэкшот)
 VERSIONS = ((30, 27 * FPS + 15), (59, 56 * FPS))
 FLASH_IN = 5
 FLASH_OUT = 10
 EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm"}
-_edit_9x16_wait = None
+_seen_log = {}
+SCRIPT_PATH = Path(__file__).resolve()
+try:
+    SCRIPT_STAMP = SCRIPT_PATH.stat().st_mtime_ns
+except OSError:
+    SCRIPT_STAMP = None
 
 
 def log(message):
@@ -69,6 +75,22 @@ def log(message):
     STATE.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
+
+
+def log_once(key, message):
+    if _seen_log.get(key) == message:
+        return
+    _seen_log[key] = message
+    log(message)
+
+
+def script_replaced():
+    if SCRIPT_STAMP is None:
+        return False
+    try:
+        return SCRIPT_PATH.stat().st_mtime_ns != SCRIPT_STAMP
+    except OSError:
+        return False
 
 
 def sources():
@@ -394,6 +416,69 @@ def edit_sources(folder=None):
     return sorted(videos_in(folder or EDITS), key=natural_key)
 
 
+def is_rendered_name(path):
+    name = path.name
+    if EDIT_OUTPUT_RE.match(name) or EDIT_9X16_OUTPUT_RE.match(name):
+        return True
+    return re.search(r"_\d+x\d+_\d+s$", path.stem.lower()) is not None
+
+
+def is_packshot_name(path):
+    stem = path.stem.lower().replace(" ", "").replace("-", "").replace("_", "")
+    return any(token in stem for token in ("packshot", "endcard", "пэкшот", "пекшот"))
+
+
+def dedupe_stems(files):
+    chosen = {}
+    for path in files:
+        key = path.stem.lower()
+        prev = chosen.get(key)
+        if prev is None or file_stamp(path) >= file_stamp(prev):
+            if prev is not None:
+                log_once(
+                    f"dup-{key}",
+                    f"дубль {prev.name} не беру, остаётся {path.name}",
+                )
+            chosen[key] = path
+        else:
+            log_once(
+                f"dup-{key}",
+                f"дубль {path.name} не беру, остаётся {prev.name}",
+            )
+    return sorted(chosen.values(), key=natural_key)
+
+
+def select_edit_clips(files):
+    """Ролики для склейки и пэкшот, если он лежит в той же папке.
+
+    Готовый рендер и карточка не считаются третьим роликом: иначе два
+    ролика превращаются в три и на 30 с каждый идёт по 10 с.
+    """
+    pack = None
+    clips = []
+    for path in files:
+        if is_rendered_name(path):
+            continue
+        if is_packshot_name(path):
+            pack = path
+            continue
+        clips.append(path)
+    clips = dedupe_stems(clips)
+    if pack is None and len(clips) >= 3:
+        short = []
+        long = []
+        for path in clips:
+            duration = media_duration(path)
+            if 0 < duration <= 3:
+                short.append(path)
+            else:
+                long.append(path)
+        if len(short) == 1 and len(long) >= 2:
+            pack = short[0]
+            clips = long
+    return clips, pack
+
+
 def edit_output_path(order, width, height, seconds, name_prefix="edit"):
     name = "+".join(path.stem for path in order)
     return OUT / f"{name_prefix}_{name}_{width}x{height}_{seconds}s.mp4"
@@ -554,7 +639,25 @@ def cleanup_edit_outputs(keep, pattern=None):
                     log(f"убрал старую итерацию {path.name}")
 
 
+def plan_stamp_path(name_prefix):
+    return STATE / f"edit_plan_{name_prefix}.txt"
+
+
+def plan_is_stale(name_prefix):
+    path = plan_stamp_path(name_prefix)
+    if not path.is_file():
+        return True
+    return path.read_text(encoding="utf-8").strip() != PLAN_VERSION
+
+
+def mark_plan_current(name_prefix):
+    STATE.mkdir(parents=True, exist_ok=True)
+    plan_stamp_path(name_prefix).write_text(PLAN_VERSION, encoding="utf-8")
+
+
 def edit_needs_encode(order, newest, name_prefix="edit"):
+    if plan_is_stale(name_prefix):
+        return True
     for width, height in SIZES:
         for seconds, _start in VERSIONS:
             dest = edit_output_path(order, width, height, seconds, name_prefix)
@@ -801,25 +904,45 @@ def encode_edit(order, infos, pack, music, planner=None, name_prefix="edit"):
         raise RuntimeError(" ".join(errors))
 
 
-def pass_edits(folder=None, name_prefix="edit", pattern=None, planner=None, label="edits"):
+def pass_edits(folder=None, name_prefix="edit", pattern=None, planner=None, label="edits", min_clips=0):
     folder = folder or EDITS
-    files = edit_sources(folder)
-    if not files:
+    raw = edit_sources(folder)
+    if not raw:
         cleanup_edit_outputs(set(), pattern)
         return False
-    states = [readiness(path) for path in files]
+    states = [readiness(path) for path in raw]
     if any(state == "wait" for state in states):
         return True
     if any(state == "skip" for state in states):
         log(f"в {label} есть пустой файл, жду нормальное видео")
         return False
+    files, folder_pack = select_edit_clips(raw)
+    if len(files) < max(min_clips, 1):
+        if min_clips > 1 and len(files) == 1:
+            log_once(
+                f"{label}-wait",
+                f"{label}: жду второй ролик, пока только {files[0].name}",
+            )
+        else:
+            cleanup_edit_outputs(set(), pattern)
+        return False
+    if folder_pack is not None:
+        log_once(
+            f"{label}-pack",
+            f"пэкшот {folder_pack.name} не ставлю в ряд, в склейке {len(files)}",
+        )
     pack = find_packshot(files[0])
+    if pack is None:
+        pack = folder_pack
     if pack is not None and readiness(pack) == "wait":
         return True
     music = find_music(files[0])
     if music is not None and readiness(music) == "wait":
         return True
-    signature = edits_signature(files)
+    watched = list(files)
+    if folder_pack is not None:
+        watched.append(folder_pack)
+    signature = edits_signature(watched)
     info_by_path = {}
     for path in files:
         frames, audio = clip_meta(path)
@@ -827,6 +950,8 @@ def pass_edits(folder=None, name_prefix="edit", pattern=None, planner=None, labe
             log(f"не читается {path.name}")
             return False
         info_by_path[path] = {"frames": frames, "audio": audio}
+    names = ", ".join(path.name for path in files)
+    log_once(f"{label}-clips", f"{label}: {len(files)} роликов ({names})")
     perms = list(permutations(files))
     expected = []
     for perm in perms:
@@ -842,20 +967,29 @@ def pass_edits(folder=None, name_prefix="edit", pattern=None, planner=None, labe
     newest = max(stamps)
     pending = [perm for perm in perms if edit_needs_encode(perm, newest, name_prefix)]
     if not pending:
+        mark_plan_current(name_prefix)
         return False
-    log(f"{label}: {len(files)} роликов, порядков {len(pending)}")
+    log(f"{label}: порядков {len(pending)}")
     made = False
+    failed = False
     for perm in pending:
-        if edits_signature(edit_sources(folder)) != signature:
+        current, current_pack = select_edit_clips(edit_sources(folder))
+        current_rows = list(current)
+        if current_pack is not None:
+            current_rows.append(current_pack)
+        if edits_signature(current_rows) != signature:
             log(f"папка {label} изменилась, собираю заново")
             return True
         infos = [info_by_path[path] for path in perm]
         try:
             encode_edit(perm, infos, pack, music, planner, name_prefix)
         except Exception as exc:
+            failed = True
             log(f"ошибка {'+'.join(path.stem for path in perm)}: {exc}")
             continue
         made = True
+    if not failed:
+        mark_plan_current(name_prefix)
     if made:
         subprocess.run(
             [
@@ -869,23 +1003,13 @@ def pass_edits(folder=None, name_prefix="edit", pattern=None, planner=None, labe
 
 
 def pass_edit_9x16():
-    global _edit_9x16_wait
-    files = edit_sources(EDIT_9X16)
-    if len(files) == 1:
-        if any(readiness(path) == "wait" for path in files):
-            return True
-        note = files[0].name
-        if _edit_9x16_wait != note:
-            log(f"edit_9x16: жду второй ролик, пока только {note}")
-            _edit_9x16_wait = note
-        return False
-    _edit_9x16_wait = None
     return pass_edits(
         EDIT_9X16,
         "edit_9x16",
         EDIT_9X16_OUTPUT_RE,
         plan_pair_9x16,
         "edit_9x16",
+        2,
     )
 
 
@@ -981,6 +1105,7 @@ def run(forever):
         return 1
 
     log("слежение запущено" if forever else "проверка MAIN, edits и edit_9x16")
+    log("edit_9x16: 2 ролика на 30 с — по 15 с, 3 ролика — по 10 с")
     try:
         OUT.mkdir(parents=True, exist_ok=True)
         EDITS.mkdir(parents=True, exist_ok=True)
@@ -993,6 +1118,10 @@ def run(forever):
         while True:
             try:
                 while True:
+                    if forever and script_replaced():
+                        log("файл скрипта заменили, перезапускаюсь")
+                        fcntl.fcntl(lock_handle.fileno(), fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+                        os.execv(sys.executable, [sys.executable, *sys.argv])
                     waiting_main = pass_once()
                     waiting_edits = pass_edits()
                     waiting_9x16 = pass_edit_9x16()
