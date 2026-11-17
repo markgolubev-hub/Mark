@@ -468,6 +468,8 @@ def plan_pair_9x16(frame_counts, seconds):
     4 ролика: 59 с по 15 с. На 30 с четыре по 10 с не входят, деление поровну.
     """
     count = len(frame_counts)
+    if count == 2 and seconds < 59:
+        return plan_capped_slots(frame_counts, seconds, 15 * FPS)
     if count == 3 and seconds < 59:
         return plan_capped_slots(frame_counts, seconds, 10 * FPS)
     if count == 3 and seconds >= 59:
@@ -561,6 +563,16 @@ def edit_needs_encode(order, newest, name_prefix="edit"):
             if dest.stat().st_mtime < newest:
                 return True
     return False
+
+
+def exact_video(label_in, frames, label_out):
+    # fps в конце иногда съедает последний кадр, и 30 с превращаются в 29.97.
+    # Добиваем клон последнего кадра и снова обрезаем ровно до нужного числа.
+    return (
+        f"{label_in}fps={FPS},trim=end_frame={frames},"
+        f"tpad=stop_mode=clone:stop=2,trim=end_frame={frames},"
+        f"setpts=PTS-STARTPTS,format=yuv420p{label_out}"
+    )
 
 
 def piece_video(src_label, take, to_white, from_white, width, height, out_label):
@@ -663,10 +675,11 @@ def build_edit_command(order, infos, pack, pack_audio, music, width, height, sec
             f"format=rgba,setpts=PTS+{delay}/TB[pk]"
         )
         graph.append(
-            "[base][pk]overlay=0:0:eof_action=pass:format=auto,fps=30,format=yuv420p[vout]"
+            "[base][pk]overlay=0:0:eof_action=pass:format=auto[base2]"
         )
+        graph.append(exact_video("[base2]", target_frames, "[vout]"))
     else:
-        graph.append("[base]fps=30,format=yuv420p[vout]")
+        graph.append(exact_video("[base]", target_frames, "[vout]"))
     music_index = None
     if music is not None:
         music_index = pack_index if pack is None else pack_index + 1
@@ -762,16 +775,20 @@ def encode_edit(order, infos, pack, music, planner=None, name_prefix="edit"):
         log(f"{seconds}с: {shown}")
     pack_audio = probe(pack)[3] if pack is not None else False
     procs = []
+    errors = []
     for width, height in SIZES:
         for seconds, pack_frame in VERSIONS:
-            dest, tmp, cmd = build_edit_command(
-                order, infos, pack, pack_audio, music, width, height, seconds, pack_frame,
-                planner, name_prefix,
-            )
+            try:
+                dest, tmp, cmd = build_edit_command(
+                    order, infos, pack, pack_audio, music, width, height, seconds, pack_frame,
+                    planner, name_prefix,
+                )
+            except Exception as exc:
+                errors.append(f"{width}x{height} {seconds}с: {exc}")
+                continue
             procs.append((dest, tmp, subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
             )))
-    errors = []
     for dest, tmp, proc in procs:
         _stdout, err = proc.communicate()
         if proc.returncode != 0:
